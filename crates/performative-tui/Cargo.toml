@@ -1,0 +1,14 @@
+[package]
+name = "performative-tui"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+performative-core   = { path = "../performative-core" }
+performative-osc    = { path = "../performative-osc" }
+performative-parser = { path = "../performative-parser" }
+ratatui             = { workspace = true }
+crossterm           = { workspace = true }
+tokio               = { workspace = true }
+anyhow              = { workspace = true }
+futures             = "0.3"

@@ -1,0 +1,186 @@
+Performative v1 — Tickets
+Each ticket produces a demoable milestone. Ordered by dependency — each builds on the previous.
+
+Ticket 1: Audio Foundation
+Boot scsynth, play a track, control it via OSC
+Deliverable
+A Rust binary that boots scsynth as a child process, loads a WAV file into a buffer via OSC, and exposes play, pause, and gain as CLI arguments. No TUI yet — just proof that the full audio pipeline works.
+Work
+
+Cargo workspace setup with performative-osc crate
+scsynth process management: spawn, wait for ready (/status polling), graceful shutdown
+OSC send/receive over UDP using rosc crate (async via tokio::net::UdpSocket)
+Write and compile 3 SynthDefs in SuperCollider: DeckPlayer (buffer playback with rate + gain), DeckEQ (3-band parametric), MasterMix (summing bus to hardware output)
+Ship compiled .scsyndef binaries, load them at boot via /d_load
+Buffer management: /b_allocRead to load WAV, /s_new to instantiate player, /n_set to change gain
+Verify: run binary, hear audio, change volume via OSC
+
+Key risks
+
+scsynth boot detection (parse stdout for "SuperCollider 3 server ready" or poll /status)
+SynthDef correctness (these must be right or nothing works downstream)
+
+Acceptance
+cargo run -- play test.wav plays audio through speakers. cargo run -- play test.wav --gain -6 plays at -6dB.
+
+Ticket 2: TUI Shell
+Ratatui interface with deck panels, command input, and the parser foundation
+Deliverable
+A fullscreen terminal app with 2 deck panels and a command input line. Typing load 1 test.wav then play 1 loads and plays audio. Deck panel shows track name, play/pause state, and a ticking playhead timer. Typing pause 1 stops playback.
+Work
+
+performative-tui crate: Ratatui app with crossterm backend, alternate screen buffer
+performative-core crate: Deck struct (track name, state, playhead position), AppState (2 decks, focused deck, mode)
+performative-parser crate: lexer + parser for load, play, pause commands. No operators yet — just single commands.
+Deck widget: border, track name, play state indicator, time display, progress bar
+Command input widget: text input with cursor, enter to execute
+Tokio event loop: keyboard events (crossterm) + OSC responses + 30fps UI tick
+Playhead tracking: on each tick, query scsynth for buffer position via /b_query or calculate from elapsed time + rate
+Wire it all together: command → parser → OSC dispatch → state update → UI render
+
+Key risks
+
+Event loop architecture (getting tokio::select! right with crossterm's event stream)
+Playhead accuracy (calculating position from system clock vs querying SC)
+
+Acceptance
+Launch app, see two deck panels. Type load 1 song.wav, see track name appear. Type play 1, see playhead timer ticking. Type pause 1, playback stops. No crashes, no flickering.
+
+Ticket 3: EQ, Gain Ramps, and the over Modifier
+Make decks sound-controllable with timed parameter changes
+Deliverable
+gain and eq commands work with instant values and timed ramps. You can type gain 1 -6db, eq 1 low kill, and eq 1 hi 0.5 over 4bars. Deck panels show current EQ state.
+Work
+
+Extend DeckPlayer SynthDef (or add DeckEQ as a separate synth in the signal chain) with 3-band EQ params (lo_gain, mid_gain, hi_gain) and a gain envelope that supports Line.kr ramping
+Parser: add gain and eq commands with value parsing (dB, 0.0-1.0 scale, kill, reset) and optional over <duration> modifier
+Duration parsing: 4bars, 16bars, 8beats, 30s → convert to seconds using head deck BPM
+OSC dispatch: instant changes use /n_set, timed ramps use a SynthDef with Line.kr(start, end, duration) or SC's built-in /n_set with lag
+Update deck widget to show EQ state: EQ: hi 1.0  mid 1.0  low 0.0
+Sugar: kill 1 low → eq 1 low 0.0, fadein 2 16bars → gain 2 0db over 16bars, fadeout 1 4bars → gain 1 -inf over 4bars
+
+Key risks
+
+Server-side ramping: need to decide between Line.kr envelopes (requires a ramp synth per param change) vs SC's built-in node lag (simpler but less precise)
+Duration-to-seconds conversion requires knowing current BPM
+
+Acceptance
+Type eq 1 low kill — bass disappears instantly. Type eq 1 low 1.0 over 4bars — bass fades back in smoothly over 4 bars. Type fadein 2 16bars — deck 2 ramps from silence to full over 16 bars. UI shows EQ values updating.
+
+Ticket 4: Operators and Composition
+|, &, >, ; — the expression language
+Deliverable
+You can type compound expressions like 2 | eq hi 0.25 & fadein 16bars > 1 | eq low kill over 4bars > fadeout 1 4bars and have them execute with correct timing.
+Work
+
+Parser: extend lexer with |, &, >, ; tokens
+AST: Expression → list of SequentialGroups (separated by >), each containing ParallelGroups (separated by &), each optionally prefixed by a pipe context (N |)
+Pipeline evaluator: walk the AST, resolve pipe contexts (inject deck number into commands that lack one), collect OSC messages per group, timestamp sequential groups based on cumulative over durations
+OSC bundle dispatch: group 1 messages sent as an OSC bundle with "now" timestamp. Group 2+ sent as bundles with future timestamps (scsynth supports timed bundles natively)
+Error handling: if any command in the expression fails to parse, report the error and dispatch nothing
+TUI: show active timed commands in a status area (e.g., "fadein 2: 12/16 bars")
+
+Key risks
+
+OSC bundle timestamps: scsynth uses NTP-style timestamps for timed bundles. Need to correctly calculate absolute timestamps from relative bar durations.
+Pipe context resolution: ensure deck number propagates correctly and resets at > boundaries
+
+Acceptance
+Type 2 | eq hi 0.25 & fadein 16bars > 1 | eq low kill over 4bars > fadeout 1 4bars. Deck 2 fades in with cut highs. After 16 bars, deck 1's lows kill over 4 bars. After those 4 bars, deck 1 fades out. A parse error in any part of the expression prevents all execution.
+
+Ticket 5: Sync, Cue, Loop
+Beat-matched mixing — the core DJ workflow
+Deliverable
+You can load two tracks, sync their BPMs, set hot cues, loop sections, and preview in headphones. This is where Performative becomes a functional DJ tool.
+Work
+
+performative-analysis crate: shell out to Python/Essentia for BPM, key, and beat position analysis. Cache results as JSON in ~/.performative/cache/<hash>/analysis.json
+sync command: look up pre-computed Rubberband stretch (or compute on-demand for v1), load stretched buffer, phase-align to head deck's beat grid
+Rubberband integration: shell out to the rubberband CLI for stretching, or use FFI bindings. Cache stretched WAVs.
+head command: set reference deck, update scheduling clock BPM
+cue command: set A saves current playhead position to cache. A seeks to that position. Persist across sessions.
+loop command: set loop in/out points based on current playhead + bar length. off/halve/double modifiers.
+pre command: route deck audio to cue bus (channels 2-3). Requires CueMix SynthDef.
+seek command: jump to time, bar, or relative offset
+Audio routing: 4-channel output via Aggregate Device (master on 0-1, cue on 2-3)
+Update deck widget: show BPM, key, sync state, hot cue markers, loop indicator
+performative setup CLI: create Aggregate Device with BlackHole, test audio routing
+
+Key risks
+
+Phase alignment accuracy (aligning downbeats between two tracks is the hardest audio problem here)
+Rubberband stretch quality / caching strategy
+BlackHole Aggregate Device creation (may need AppleScript or CoreAudio API)
+
+Acceptance
+Load two tracks with different BPMs. sync 2 — deck 2 plays at deck 1's BPM, beats aligned. cue 2 set A — set a cue point. loop 2 4bars — deck 2 loops. pre 2 — hear deck 2 in headphones only. seek 2 bar 16 — jump to bar 16.
+
+Ticket 6: Library Mode
+Browse, search, and load tracks without leaving the TUI
+Deliverable
+Press / to enter library mode. Fuzzy search your music folder. See BPM, key, and cache status for each track. Select to load onto a deck. Scroll through results.
+Work
+
+Library indexer: scan configured music folder on startup, read filenames + ID3 tags (use lofty or id3 crate), merge with cached analysis data
+Fuzzy search: nucleo or fuzzy-matcher crate for fast fuzzy matching as you type
+Library widget: Ratatui List with stateful scrolling, showing artist - title, BPM, key, duration, cache status
+Mode switching: / enters library mode, esc returns to command mode. Keyboard input routes to search field in library mode.
+Track loading: enter loads to focused deck, 1/2 loads to specific deck. Returns to command mode.
+Tab preview: tab on a highlighted track sends it to cue bus for audition
+performative analyze subcommand: batch-analyze all tracks in library path. Progress display. Can run in background before a set.
+
+Key risks
+
+Startup performance with large libraries (10k+ tracks) — index lazily or cache the index
+ID3 tag parsing edge cases (encoding, missing tags, etc.)
+
+Acceptance
+Press /, type "four tet", see matching tracks with BPM/key. Arrow keys scroll. Press 1 to load to deck 1. Press esc to cancel. performative analyze ~/Music processes all tracks and shows progress.
+
+Ticket 7: Sugar, Aliases, Presets, and Polish
+The expressiveness layer — make it feel like a performance instrument
+Deliverable
+Built-in sugar (fadein, fadeout, fade, cut, kill) works. Users can define custom aliases and presets. Command history with up/down arrows. Tab completion. Error messages are helpful, not cryptic.
+Work
+
+Sugar expansion: register built-in aliases in the parser. Expand before AST evaluation.
+User aliases: parse ~/.performative/aliases.toml, register as sugar. Single-token → expansion.
+Presets: parse ~/.performative/presets/ directory. Each preset is a named template with $1, $2, etc. positional params. preset command to define inline. Expand before AST evaluation.
+Command history: save to ~/.performative/history. Up/down arrow navigation. ctrl+r search.
+Tab completion: complete command names, deck numbers, track names (from library index), cue point names
+Error messages: on parse failure, highlight the problematic token in the input. Show "did you mean?" suggestions for close command names.
+Config loading: parse ~/.performative/config.toml for library path, audio devices, display FPS, sync range, snap setting
+Active transition display: show progress of timed commands in the status bar (e.g., ▶ fadein 2: ████░░░░ 8/16 bars)
+Graceful degradation: if scsynth crashes, show error and attempt reconnect. Never panic.
+
+Key risks
+
+Preset parameter expansion with nested operators (need to handle quoting/escaping correctly)
+Tab completion UX (completing mid-command without disrupting the input)
+
+Acceptance
+Type fi 2 16 (using alias) — deck 2 fades in. Define preset myswap "..." — use it by name. Up arrow recalls last command. Tab completes lo → load. Typo in a command shows a clear error message pointing to the problem. Active transitions show progress in the status bar.
+
+Dependency Graph
+Ticket 1 (Audio Foundation)
+    │
+    ▼
+Ticket 2 (TUI Shell)
+    │
+    ▼
+Ticket 3 (EQ, Gain, over) ──────┐
+    │                            │
+    ▼                            │
+Ticket 4 (Operators) ◄──────────┘
+    │
+    ▼
+Ticket 5 (Sync, Cue, Loop)
+    │
+    ├──► Ticket 6 (Library)
+    │
+    └──► Ticket 7 (Sugar, Presets, Polish)
+Tickets 6 and 7 can run in parallel after ticket 5. Everything else is sequential — each ticket's deliverable is the foundation for the next.
+
+Estimated Timeline
+TicketDurationCumulative1. Audio Foundation1–1.5 weeksWeek 1.52. TUI Shell1–1.5 weeksWeek 33. EQ, Gain, over1 weekWeek 44. Operators1–1.5 weeksWeek 5.55. Sync, Cue, Loop2 weeksWeek 7.56. Library1–1.5 weeksWeek 97. Sugar, Presets, Polish1–1.5 weeksWeek 10
+Total: ~10 weeks to v1 assuming solo dev with AI tooling assistance. Tickets 1–4 get you to a "you can mix two tracks with EQ transitions from a terminal" demo in ~5.5 weeks. That's the point where the project becomes viscerally compelling.

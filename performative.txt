@@ -1,0 +1,748 @@
+# Performative
+### Design Document v0.4
+
+---
+
+## Overview
+
+Performative is an open source, terminal-based DJ tool for macOS. It replaces the GUI of traditional DJ software with a REPL-style command interface, taking direct inspiration from the livecoding/algorave tradition while operating on full tracks rather than generated patterns.
+
+The core thesis: **everything a DJ does physically can be expressed as a composable typed command, and the information a DJ gets from headphone cueing can be replaced by a rich terminal UI.**
+
+Performative is novel. No existing tool combines livecoded DJ performance with full track mixing, stem separation, and a Unix-style command language. The closest things — VDJScript, pyCrossfade, algorave tools — each cover a slice but nothing covers the whole.
+
+---
+
+## Goals
+
+- Perform a complete DJ set using only a laptop and a terminal
+- Make transitions, loops, stems, and hot cues expressible as composable typed commands
+- Be projectable — watching someone perform in Performative should be as compelling as watching a livecoder
+- Be open source and extensible — users should be able to define their own commands, presets, and shorthands the same way they customize a shell
+- Require zero external hardware for basic use; support cheap USB audio for headphone cueing
+- Ship as a single binary with minimal external dependencies
+
+---
+
+## Non-Goals (v1)
+
+- Windows / Linux support (Linux planned for v2 via JACK)
+- Set saving / session replay
+- Network/collaborative performance
+- Real-time stem separation (stems are processed on first load, cached)
+- Visual output / VJ integration (future)
+- More than 2 decks (v1 ships with 2; architecture supports 4)
+
+---
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────┐
+│                  Performative                        │
+│              (Rust + Ratatui + Tokio)                │
+│                                                      │
+│  ┌──────────┐  ┌──────────┐  ┌──────────────────┐   │
+│  │ Command  │  │  State   │  │   TUI Renderer   │   │
+│  │ Parser   │  │ Manager  │  │   (Ratatui)      │   │
+│  └────┬─────┘  └────┬─────┘  └────────┬─────────┘   │
+│       │              │                 │             │
+│  ┌────▼──────────────▼─────────────────▼─────────┐  │
+│  │              Event Loop (Tokio)                │  │
+│  │  Keyboard → OSC TX → OSC RX → UI Tick         │  │
+│  └────────────────┬──────────────────────────────┘  │
+└───────────────────┼──────────────────────────────────┘
+                    │ OSC (localhost UDP)
+┌───────────────────▼──────────────────────────────────┐
+│                scsynth (headless)                     │
+│        Pre-compiled SynthDefs, no sclang              │
+│                                                       │
+│  Deck buses (1-2)  │  Master bus  │  Cue bus          │
+└────────────────────┬─────────────────────────────────┘
+                     │
+        ┌────────────┴────────────┐
+        ▼                         ▼
+  Built-in output            BlackHole 2ch
+  (master / speakers)       (cue / headphones)
+```
+
+### Why Rust + Ratatui (not TypeScript + Ink)
+
+Ink (React for terminals) was the original plan, but it has a fundamental architectural problem for real-time applications: it performs full-tree traversal and complete screen redraws on every state change. Even when a single timer updates, Ink erases all terminal lines and redraws everything. This causes visible flickering, especially in tmux — which many performers use.
+
+Ratatui uses immediate-mode rendering with intelligent buffer diffing. It maintains a back buffer, renders the full UI to it, then diffs against the previous frame and only writes changed cells to the terminal. Benchmarks show 60+ FPS with complex layouts. It has built-in scrolling, sparklines (for waveforms), tables (for library mode), and a scrollbar widget.
+
+Additional benefits of Rust for this project:
+- **Single binary distribution.** No Node/Bun/Python runtime. `brew install performative` and you're done.
+- **`rosc` crate.** Pure Rust OSC implementation with 350k+ downloads. A `rosc_supercollider` fork handles SC's augmented OSC format.
+- **`sorceress` crate.** Rust bindings for SuperCollider that can compile SynthDefs and manage scsynth — eliminating the sclang dependency entirely.
+- **`tokio` for async.** A single event loop handles keyboard input, OSC send/receive, and UI tick updates concurrently with zero blocking.
+- **Rubberband FFI.** Direct C bindings to Rubberband's native library — no WASM indirection, full R3 engine quality.
+
+---
+
+## Analysis Pipeline
+
+Runs on first load, results cached. Track is playable after BPM/beat analysis completes (~2-5s). Stems available when Demucs finishes (~12-30s on Apple Silicon via MLX).
+
+```
+Track file (any format)
+    → FFmpeg/Symphonia  — decode to WAV (Symphonia is pure Rust, no FFmpeg needed for common formats)
+    → Essentia (Python)  — BPM, key, downbeats, section boundaries, energy curve
+    → Cache             — stored in ~/.performative/cache/<track_hash>/
+    
+Phase 2 (deferred to v1.1+):
+    → Demucs-MLX        — stem separation (drums, bass, vocals, other)
+    → Rubberband        — pre-computed time-stretch at target BPMs (±15% range, 1 BPM increments)
+```
+
+**Note on Essentia:** While essentia.js exists for Node, the Python bindings are more battle-tested and offer the full algorithm set. Since Demucs already requires Python (for now), we accept Python as an analysis-time dependency. Analysis runs before/outside of performance, never during a live set.
+
+**Pre-analysis mode:**
+```bash
+performative analyze ~/Music    # batch process entire library
+performative analyze track.mp3  # single track
+```
+
+---
+
+## Stack
+
+| Layer | Technology | Rationale |
+|---|---|---|
+| Application | Rust | Single binary, zero-cost abstractions, excellent async |
+| TUI | Ratatui + Crossterm | Sub-ms rendering, buffer diffing, built-in scrolling/widgets |
+| Async runtime | Tokio | Event loop for keyboard, OSC, and UI tick concurrently |
+| OSC | rosc / rosc_supercollider | Pure Rust OSC, SC-compatible, 350k+ downloads |
+| Audio engine | scsynth (SuperCollider server) | Real-time audio scheduling, OSC native, bus routing |
+| SC integration | sorceress (optional) | Rust SynthDef compilation, eliminates sclang |
+| Audio analysis | Essentia (Python) | BPM, key, beats, structure — analysis-time only |
+| Stem separation | Demucs-MLX (Python) | Best quality, 34x realtime on M4 Max — deferred to v1.1 |
+| Time-stretching | Rubberband (C FFI) | Industry standard, R3 engine, GPL-compatible |
+| Inter-process | OSC over localhost UDP | Sub-millisecond, language agnostic |
+
+---
+
+## Audio Routing
+
+### No external hardware (default)
+- scsynth outputs 4 channels via macOS Aggregate Device
+- Channels 0-1 → Built-in Output (speakers/venue)
+- Channels 2-3 → BlackHole 2ch (headphones/cue)
+- **Important:** Set Aggregate Device clock source to Built-in Output, not BlackHole, to prevent drift in long sessions.
+- Cost: $0. BlackHole is free and open source (GPL-3).
+
+### With USB audio dongle (~$15)
+- scsynth master bus → Built-in Output
+- scsynth cue bus → USB dongle output
+- macOS Aggregate Device combines both
+- No virtual audio drivers needed
+
+### Setup automation
+Performative ships a `performative setup` command that:
+1. Checks for BlackHole installation (offers to install via Homebrew)
+2. Creates the Aggregate Device programmatically
+3. Configures scsynth to use it
+4. Verifies audio routing with a test tone
+
+---
+
+## Deck Model
+
+Performative v1 has **2 decks** (architecture supports 4; expansion in v1.1). Each deck has:
+
+- **Track** — loaded file, analyzed on first load
+- **Playhead** — current position in the track
+- **BPM** — native BPM of the track (from analysis)
+- **Stretched BPM** — current playing BPM after sync
+- **EQ** — 3-band per deck (hi, mid, low)
+- **Gain** — per deck level
+- **Hot cues** — named positions (A, B, C, D)
+- **Loop** — active loop region (in/out points)
+- **Bus routing** — master, cue, or both
+
+### Head deck
+
+One deck is always designated the **head**. The head deck's BPM is the reference — the other deck timestretches to match when synced. The SuperCollider scheduling clock follows the head deck's beat grid.
+
+```bash
+head 2    # deck 2 becomes the reference
+```
+
+---
+
+## Sync Model
+
+Sync is **opt-in**. When you sync a deck to the head:
+
+1. Look up the nearest pre-computed Rubberband stretch (cached at integer BPMs ±15% of native BPM)
+2. Load the stretched buffer into scsynth
+3. Phase-align downbeats — nudge playhead so beat 1 aligns with head deck's beat 1
+4. Deck now plays at head BPM, beats locked
+
+Tracks play at **native BPM by default**. Sync explicitly changes this.
+
+**BPM range limitation:** Sync works within ±15% of native BPM. Beyond that, Rubberband artifacts become audible. The system warns the user if a sync would exceed this range.
+
+---
+
+## Clock Model
+
+Two independent clocks:
+
+**Track clock** — each deck has its own beat grid from analysis. Loop points, hot cues, and bar counts are in the track's own bars.
+
+**Scheduling clock** — scsynth's TempoClock, locked to the head deck's beat grid. All timed actions (`over`, `>` sequencing) are measured in head-deck bars.
+
+---
+
+## Operators
+
+Performative has four operators for composing commands, inspired by Unix shell semantics.
+
+### `|` — Pipe (pass deck context forward)
+
+Sets the deck context for subsequent commands so you don't repeat the deck number. The value to the left of `|` becomes the implicit deck argument for everything to the right.
+
+```bash
+2 | eq hi 0.25 & gain 0db over 16bars
+# Equivalent to: eq 2 hi 0.25 & gain 2 0db over 16bars
+```
+
+Pipe context applies within a parallel group. After a `>` boundary, context resets — you either pipe again or specify decks explicitly.
+
+```bash
+2 | eq hi 0.25 & fadein 16bars > 1 | eq low kill over 4bars
+# Group 1 targets deck 2. Group 2 targets deck 1.
+```
+
+Pipe context is optional syntactic sugar. You can always write deck numbers explicitly:
+```bash
+eq 2 hi 0.25 & fadein 2 16bars > eq 1 low kill over 4bars
+# Identical behavior, just more verbose
+```
+
+Commands that inherently need two deck references (like `fade 1 2 16bars`) always take explicit arguments — pipe context doesn't apply.
+
+### `&` — Parallel (fire at the same beat boundary)
+
+Groups commands that start simultaneously.
+
+```bash
+eq 2 hi 0.25 & gain 2 0db over 16bars
+# Both start at the same moment: deck 2's highs cut while it fades in
+```
+
+### `>` — Sequential (fire after the previous group completes)
+
+The next group fires when the longest timed command in the previous group finishes.
+
+```bash
+fadein 2 16bars > eq 1 low kill over 4bars > fadeout 1 4bars
+# Fade in (16 bars), THEN bass-swap (4 bars), THEN fade out (4 bars)
+```
+
+Works the same in live command mode and inside presets. scsynth handles the scheduling server-side via OSC bundles with future timestamps.
+
+### `;` — Separator (independent commands, one line)
+
+Runs commands independently with no timing relationship. Equivalent to typing them on separate lines.
+
+```bash
+play 1; load 2 "four tet"
+# Same as pressing enter between them
+```
+
+### Precedence
+
+From tightest to loosest binding: `|` → `&` → `>` → `;`
+
+This mirrors Unix conventions where `|` binds tighter than `&&` which binds tighter than `;`.
+
+**Full example with all operators:**
+```bash
+2 | eq hi 0.25 & fadein 16bars > 1 | eq low kill over 4bars & loop 2 off > fadeout 1 4bars & head 2
+```
+
+Parsed as:
+```
+Group 1 (fires immediately):        [2 | eq hi 0.25]  &  [2 | fadein 16bars]
+Group 2 (fires after 16 bars):      [1 | eq low kill over 4bars]  &  [loop 2 off]
+Group 3 (fires after 4 more bars):  [fadeout 1 4bars]  &  [head 2]
+```
+
+### The `over` modifier
+
+Any command that changes a value can take an `over` duration to ramp smoothly instead of snapping instantly. SuperCollider handles the ramping server-side via `Line.kr`, so there's no Rust-side polling.
+
+```bash
+gain 2 0db over 16bars       # ramp gain from current to 0dB over 16 bars
+eq 1 low 0.25 over 4bars     # ramp low EQ to 25% over 4 bars
+eq 1 low kill over 2bars     # ramp low to -inf over 2 bars
+```
+
+Without `over`, changes are instant (snapped to next beat).
+
+**Evaluation model:** The entire expression is parsed before anything executes. If any command fails to parse, nothing dispatches — the music never stops because of a typo. Each group produces OSC messages with appropriate timestamps. Group 1 dispatches immediately (snapped to next beat boundary). Group 2's messages carry a future timestamp based on group 1's longest `over` duration. And so on.
+
+---
+
+## v1 Command Set (10 Essential Commands)
+
+These 10 commands plus the four operators (`|`, `&`, `>`, `;`) are the minimum viable language for performing a DJ set.
+
+### 1. `load`
+Load a track onto a deck. Triggers analysis if not cached.
+```bash
+load 1 "bicep - glue"            # fuzzy search library
+load 2 ~/music/bicep-glue.mp3    # filepath
+```
+Fuzzy search matches against filename and ID3 tags. On ambiguous match, shows candidates for selection.
+
+### 2. `play` / `pause`
+```bash
+play 1          # start deck 1
+pause 1         # pause deck 1
+play             # start the focused deck
+```
+`play` without a deck number operates on the "focused" deck (last loaded or last interacted with).
+
+### 3. `sync`
+Sync a deck to the head. Loads pre-stretched audio and phase-aligns beats.
+```bash
+sync 2          # sync deck 2 to head
+sync off 2      # remove sync, return to native BPM
+```
+
+### 4. `gain`
+Set deck volume. Supports absolute dB, relative adjustment, auto-match, and timed ramps.
+```bash
+gain 2 -3db                  # instant set to -3dB
+gain 2 +1.5db                # relative adjustment
+gain match 2 1               # RMS-match deck 2 to deck 1
+gain 2 0db over 16bars       # ramp to 0dB over 16 bars (= fade in)
+gain 1 -inf over 4bars       # ramp to silence over 4 bars (= fade out)
+```
+
+### 5. `eq`
+3-band EQ per deck. Bands are `hi`, `mid`, `low`. Values are 0.0–1.0 scale (1.0 = unity, 0.0 = silent). Supports `over` for timed ramps.
+```bash
+eq 1 low 0.0                     # instant kill lows
+eq 1 hi 0.5 mid 0.8              # multiple bands at once
+eq 1 low kill                     # alias for low 0.0
+eq 1 low kill over 2bars          # ramp lows to zero over 2 bars
+eq 1 reset                        # all bands back to 1.0
+```
+
+### 6. `cue`
+Set and jump to hot cue points. Up to 4 per track (A, B, C, D).
+```bash
+cue 1 set A           # set cue A at current position on deck 1
+cue 1 A               # jump to cue A
+```
+Hot cues are saved to the track's cache and persist between sessions.
+
+### 7. `loop`
+Create a loop at the current playhead position.
+```bash
+loop 1 4bars          # loop current 4 bars on deck 1
+loop 1 off            # disable loop
+loop 1 halve          # cut loop length in half (4→2→1 bars)
+loop 1 double         # double loop length
+```
+
+### 8. `pre`
+Send a deck to the cue bus (headphones) for previewing.
+```bash
+pre 2                 # preview deck 2 in headphones
+pre off               # stop previewing
+pre blend 0.5         # 50% master / 50% cue in headphones
+```
+
+### 9. `head`
+Set which deck is the BPM/scheduling reference.
+```bash
+head 2                # deck 2 is now the reference
+```
+
+### 10. `seek`
+Jump to a position in a track.
+```bash
+seek 2 1:30           # jump to 1 minute 30 seconds
+seek 2 bar 32         # jump to bar 32
+seek 2 +4bars         # skip forward 4 bars
+seek 2 -8bars         # skip back 8 bars
+```
+
+---
+
+## Syntactic Sugar
+
+Built-in aliases that expand to primitive commands. These ship with Performative and are implemented with the same machinery as user-defined aliases.
+
+```
+Sugar                       Expands to
+─────────────────────────   ──────────────────────────────────────────────
+fadein 2 16bars             gain 2 0db over 16bars
+fadeout 1 4bars             gain 1 -inf over 4bars
+fade 1 2 16bars             gain 1 -inf over 16bars & gain 2 0db over 16bars
+cut 1 2                     gain 1 -inf & gain 2 0db & head 2
+kill 1 low                  eq 1 low 0.0
+```
+
+Users can define their own aliases in `~/.performative/aliases.toml`:
+```toml
+[aliases]
+f = "fade"
+fi = "fadein"
+fo = "fadeout"
+s = "sync"
+l = "load"
+p = "play"
+```
+
+---
+
+## Presets
+
+Named transition macros with positional parameters. Presets are the power-user feature — they let performers encode their signature transitions as reusable one-liners.
+
+```bash
+# Define a preset
+preset bassswap "$2 | eq hi 0.25 & fadein $3 > $1 | eq low kill over $4 & loop $2 off > fadeout $1 $4"
+
+# Use it
+bassswap 1 2 16bars 4bars
+```
+
+Presets live in `~/.performative/presets/` and are loaded on startup. They can be shared like dotfiles.
+
+**Example preset library:**
+```bash
+# Classic crossfade
+preset xfade "fade $1 $2 $3 > head $2"
+
+# Bass swap — cut incoming highs, blend in, swap bass, drop outgoing
+preset bassswap "$2 | eq hi 0.25 & fadein $3 > $1 | eq low kill over $4 & loop $2 off > fadeout $1 $4"
+
+# Drop — hard cut with loop release
+preset drop "loop $2 off & cut $1 $2"
+
+# Echo out — fade with EQ sweep (requires filter command in v1.1)
+preset echoout "$1 | eq low 0.3 over $2 & eq hi 0.3 over $2 & fadeout $2"
+```
+
+---
+
+## Example: A Complete EQ Transition
+
+Here's the exact transition scenario from design review, showing how it maps to commands.
+
+**Setup phase** (typed one command at a time, between songs):
+```bash
+play 1                            # deck 1 is playing
+load 2 "four tet - baby"         # load next track
+sync 2                            # match BPM to deck 1
+cue 2 set A                      # mark a good entry point
+loop 2 4bars                      # set a 4-bar loop
+pre 2                             # preview in headphones — sounds good
+eq 2 hi 0.25                     # pre-cut highs so it blends under deck 1
+```
+
+**Transition — scripted** (one compound command):
+```bash
+2 | fadein 16bars & eq hi 0.25 > 1 | eq low kill over 4bars & loop 2 off > fadeout 1 4bars & head 2
+```
+
+**Transition — live** (three commands, timed by ear):
+```bash
+> 2 | fadein 16bars & eq hi 0.25
+  ... 16 bars pass, listening to the blend ...
+> 1 | eq low kill over 4bars & loop 2 off
+  ... 4 bars pass, bass swap lands ...
+> fadeout 1 4bars & head 2
+```
+
+Both approaches are valid. The scripted version commits the whole transition upfront. The live version lets you react — if the blend doesn't sound right at bar 8, you can `fadeout 2 4bars` to abort instead of continuing.
+
+**What happens, beat by beat (scripted version):**
+1. **Bars 1–16:** Deck 2 fades in from silence to full volume. Its highs are already at 25%, so it sits under deck 1.
+2. **Bar 17:** The fade-in completes. Group 2 fires: deck 1's lows ramp to zero over 4 bars (the bass swap), and simultaneously deck 2's loop releases so it plays freely.
+3. **Bar 21:** The bass swap completes. Group 3 fires: deck 1 fades out over 4 bars, and deck 2 becomes the new head.
+4. **Bar 25:** Deck 1 is silent. Deck 2 is playing solo. Transition complete.
+
+**With the preset:**
+```bash
+bassswap 1 2 16bars 4bars
+```
+
+One command. Twenty-four bars of a professional-sounding EQ transition.
+
+---
+
+## Reserved for v1.1+
+
+These commands are designed but deferred:
+- `stem` — mute/solo/fade individual stems (requires Demucs)
+- `filter` — filter sweep transitions (low-pass / high-pass ramp)
+- `every` — repeat a command on clock boundaries (`every 16bars kill 1 low`)
+- `at` — schedule a command at a specific bar (`at bar 64 fade 1 2 16bars`)
+- `fx` — effects (reverb, delay, etc.)
+
+---
+
+## Modes
+
+### Command Mode (default)
+
+The primary interface. Deck states render persistently at top, command input at bottom. All rendering via Ratatui with buffer diffing — only changed cells update.
+
+```
+┌─ DECK 1 ──────────────────────┐ ┌─ DECK 2 ──────────────────────┐
+│ Bicep - Glue           HEAD   │ │ Four Tet - Baby        SYNCED  │
+│ 128.3 BPM  A min              │ │ 120.0→128.3 BPM  F maj        │
+│ ████████████░░░░░░░░░░░░░░░░  │ │ ░░░░░░░░░░░░░░░░░░░░░░░░░░░░  │
+│ 2:14 / 6:32   Bar 32  Beat 3  │ │ 0:00 / 5:18                   │
+│ [A] [B]                       │ │                               │
+│ EQ: hi 0  mid 0  low -6      │ │ EQ: hi 0  mid 0  low 0       │
+└───────────────────────────────┘ └───────────────────────────────┘
+  MASTER: ████████░░  -3db       CUE: deck 2  blend: 0.5
+
+> 2 | fadein 16bars & eq hi 0.25 > 1 | eq low kill over 4bars & loop 2 off > fadeout 1 4bars_
+```
+
+UI updates at 30fps for playhead/beat counter. Ratatui's diffing ensures only the changed characters (time display, beat number, progress bar position) are written to the terminal. No flickering.
+
+### Library Mode (v1)
+
+Entered via `/` from command mode. Built with Ratatui's built-in `List` widget with stateful scrolling.
+
+```
+┌─ LIBRARY ─────────────────────────────────────────────────────────────┐
+│ /four tet_                                                            │
+│                                                                        │
+│ ▶ Four Tet - Baby              120 BPM  F maj  5:18   ✓ cached       │
+│   Four Tet - Pyramid           125 BPM  G min  6:44   ✓ cached       │
+│   Four Tet - Angel Echoes      118 BPM  C maj  4:52   ✓ cached       │
+│   Four Tet - She Just Likes    122 BPM  A min  5:33   ○ not analyzed  │
+│                                                                        │
+│  enter: load to focused deck   1/2: load to specific deck            │
+│  tab: preview in cue   esc: command mode                              │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+### Cue Mode (v1.1)
+
+Deferred. Requires waveform rendering infrastructure.
+
+---
+
+## Rust Crate Structure
+
+```
+performative/
+├── Cargo.toml
+├── crates/
+│   ├── performative-core/      # State, deck model, clock
+│   │   └── src/
+│   │       ├── deck.rs          # Deck struct, playback state
+│   │       ├── clock.rs         # Track clock, scheduling clock
+│   │       ├── library.rs       # Track index, fuzzy search
+│   │       └── state.rs         # AppState, mode tracking
+│   │
+│   ├── performative-osc/       # SuperCollider communication
+│   │   └── src/
+│   │       ├── client.rs        # OSC send (UDP)
+│   │       ├── server.rs        # OSC receive (async)
+│   │       ├── messages.rs      # Typed SC command builders
+│   │       └── scsynth.rs       # Process management (boot/quit)
+│   │
+│   ├── performative-parser/    # Command language
+│   │   └── src/
+│   │       ├── lexer.rs         # Tokenizer (commands, |, &, >, ;, over)
+│   │       ├── parser.rs        # Command AST
+│   │       ├── commands.rs      # Command enum + validation
+│   │       ├── pipeline.rs      # | (pipe) & (parallel) > (sequential) ; (separator)
+│   │       └── sugar.rs         # Built-in aliases + user aliases + presets
+│   │
+│   ├── performative-tui/       # Terminal UI
+│   │   └── src/
+│   │       ├── app.rs           # Main render loop
+│   │       ├── deck_widget.rs   # Deck panel widget
+│   │       ├── input_widget.rs  # Command input with history
+│   │       ├── library_widget.rs # Library browser
+│   │       └── meter_widget.rs  # Level meters, status bar
+│   │
+│   └── performative-analysis/  # Python subprocess orchestration
+│       └── src/
+│           ├── essentia.rs      # BPM, key, beats via Python
+│           ├── demucs.rs        # Stem separation (v1.1)
+│           └── cache.rs         # Cache management
+│
+├── synthdefs/                  # Pre-compiled SuperCollider SynthDefs
+│   ├── deck_player.scsyndef     # Buffer playback with rate/gain
+│   ├── deck_eq.scsyndef         # 3-band parametric EQ
+│   ├── master_mix.scsyndef      # Master bus summing + crossfader
+│   ├── cue_mix.scsyndef         # Cue bus routing + blend
+│   └── compile.scd              # SC source for compiling these
+│
+└── scripts/
+    ├── analyze.py               # Essentia analysis wrapper
+    └── setup_audio.sh           # BlackHole + Aggregate Device setup
+```
+
+### Event Loop (Tokio)
+
+```rust
+// Simplified main loop structure
+loop {
+    tokio::select! {
+        // 1. Keyboard input (crossterm events)
+        Some(event) = keyboard_rx.recv() => {
+            handle_key(event, &mut state, &osc_tx);
+        }
+        
+        // 2. OSC responses from scsynth
+        Some(msg) = osc_rx.recv() => {
+            handle_osc_response(msg, &mut state);
+        }
+        
+        // 3. UI tick (30fps)
+        _ = tick_interval.tick() => {
+            // Update playhead positions, beat counters
+            state.tick();
+            terminal.draw(|frame| render(frame, &state))?;
+        }
+    }
+}
+```
+
+The key insight: keyboard and OSC are event-driven (fire when ready), but the UI renders on a fixed 30fps tick. This prevents the UI from thrashing on rapid OSC responses while keeping the display smooth.
+
+---
+
+## SynthDefs
+
+Performative ships 4 pre-compiled SynthDefs. These are written in SuperCollider's language, compiled once, and loaded as binary `.scsyndef` files at runtime. No sclang interpreter needed.
+
+### DeckPlayer
+Plays a stereo buffer with variable rate (for time-stretch) and gain control. Outputs to a configurable bus.
+
+### DeckEQ
+3-band parametric EQ (low shelf, mid peak, high shelf). Parameters controlled via OSC `/n_set` messages.
+
+### MasterMix
+Reads from deck buses, applies crossfader curve, outputs to hardware bus 0-1 (master).
+
+### CueMix
+Reads from deck buses, applies cue blend control, outputs to hardware bus 2-3 (cue/headphones).
+
+---
+
+## Configuration & Customization
+
+Everything lives in `~/.performative/`:
+
+```
+~/.performative/
+    config.toml         # settings
+    aliases.toml        # command shorthands
+    presets/             # named transition macros
+    history              # command history (readline-style)
+    cache/               # per-track analysis + stretched audio
+        <track_hash>/
+            analysis.json    # BPM, key, beats, sections
+            waveform.bin     # pre-computed waveform display data
+            stretch_124.wav  # pre-stretched at 124 BPM
+            stretch_125.wav  # etc.
+```
+
+Config example:
+```toml
+[library]
+path = "~/Music"
+
+[audio]
+master_device = "Built-in Output"
+cue_device = "BlackHole 2ch"
+block_size = 64
+
+[display]
+fps = 30
+
+[sync]
+max_stretch_percent = 15    # warn beyond ±15% BPM change
+snap = "bar"                # snap commands to nearest bar
+```
+
+---
+
+## Build Phases
+
+### Phase 0: Proof of Concept (Weeks 1-2)
+- Boot scsynth from Rust via `std::process::Command`
+- OSC roundtrip: send `/status`, receive response
+- Load a WAV buffer, play it, stop it
+- Ratatui shell: 2 deck panels + command input
+- Parse and execute: `load`, `play`, `pause`
+
+### Phase 1: Core DJ (Weeks 3-6)
+- `gain` with `over` modifier (timed ramps)
+- `eq` with `over` modifier and `kill`/`reset`
+- `sync` with pre-computed Rubberband stretches
+- `cue` (hot cue set/jump)
+- `loop` (4bars/off/halve/double)
+- `pre` (cue bus routing via BlackHole)
+- `head` (set reference deck)
+- `seek` (jump to position)
+- `|` operator (pipe context)
+- `&` operator (parallel execution)
+- `>` operator (sequential scheduling)
+- `;` operator (command separator)
+- Built-in sugar: `fadein`, `fadeout`, `fade`, `cut`, `kill`
+- Command history (up/down arrow)
+- Essentia integration for BPM/key analysis
+
+### Phase 2: Library + Polish (Weeks 7-10)
+- Library mode with fuzzy search
+- Track pre-analysis CLI (`performative analyze`)
+- Waveform display (Ratatui sparklines)
+- Error handling (commands fail gracefully, music never stops)
+- `performative setup` (audio routing wizard)
+- Tab completion for commands and track names
+- User-defined aliases (`~/.performative/aliases.toml`)
+- Presets (`~/.performative/presets/`)
+
+### Phase 3: Stems + Advanced (Weeks 11-16)
+- Demucs integration (stem separation)
+- `stem` command (mute/solo/fade per stem)
+- `filter` command (low-pass / high-pass sweep)
+- `at` / `every` scheduling commands
+- Expand to 4 decks
+
+---
+
+## Why Performative Is Different
+
+| | Traditional DJ software | Algorave / TidalCycles | Performative |
+|---|---|---|---|
+| Interface | GUI | Code editor | Terminal REPL |
+| Music source | Full tracks | Generated patterns | Full tracks |
+| Transitions | Physical faders | Pattern replacement | Typed commands |
+| Stems | Yes (Serato/VDJ) | N/A | Yes (v1.1) |
+| Projectable | No | Yes | Yes |
+| Hardware required | Yes | No | No |
+| Scriptable/extensible | Limited | Yes (Haskell/JS) | Yes (presets, aliases) |
+| Livecoded aesthetic | No | Yes | Yes |
+| Language | N/A | Haskell/JS/Python | Rust |
+| Distribution | Installer + runtime | Package manager | Single binary |
+
+---
+
+## Open Questions
+
+- **Downbeat detection accuracy.** Essentia gives beat positions, but identifying beat 1 of a bar requires heuristics. Plan: allow manual downbeat correction via `cue 1 set downbeat` and save to cache.
+- **Key-based track suggestions.** Harmonic mixing recommendations in library mode based on Camelot wheel. Straightforward once key detection is in place.
+- **MIDI input.** Map physical controller knobs/faders to commands. Rust has `midir` crate for cross-platform MIDI.
+- **Recording.** Capture master output to file. scsynth supports this natively via `/b_write`.
+- **Collaborative performance.** Two performers sharing a session over network. TCP bridge for OSC command relay.

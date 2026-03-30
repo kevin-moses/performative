@@ -1,0 +1,23 @@
+# Build artifacts
+/target/
+
+# Music/audio files
+*.wav
+*.mp3
+*.flac
+*.aiff
+*.aif
+*.ogg
+*.m4a
+
+# Compiled SynthDefs (regenerate with: sclang synthdefs/compile.scd)
+synthdefs/*.scsyndef
+
+# macOS
+.DS_Store
+
+# Editor
+.idea/
+.vscode/
+*.swp
+*.swo

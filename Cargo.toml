@@ -1,0 +1,37 @@
+[workspace]
+members = [
+    "crates/performative-osc",
+    "crates/performative-core",
+    "crates/performative-parser",
+    "crates/performative-tui",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["performative"]
+
+[workspace.dependencies]
+tokio     = { version = "1", features = ["full"] }
+anyhow    = "1"
+ratatui   = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
+rosc      = "0.10"
+
+[package]
+name = "performative"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "performative"
+path = "src/main.rs"
+
+[dependencies]
+performative-tui = { path = "crates/performative-tui" }
+tokio            = { workspace = true }
+anyhow           = { workspace = true }
+
+[profile.release]
+opt-level = 3

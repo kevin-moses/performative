@@ -1,0 +1,11 @@
+[package]
+name = "performative-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+performative-osc    = { path = "../performative-osc" }
+performative-parser = { path = "../performative-parser" }
+tokio               = { workspace = true }
+anyhow              = { workspace = true }
+rosc                = { workspace = true }
