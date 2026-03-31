@@ -56,7 +56,21 @@
       "Bash(git status:*)",
       "Bash(git -C /Users/Kevin/code/performative status -u)",
       "Bash(cargo metadata:*)",
-      "Bash(grep -r \"loop_monitor\\\\|check.*complete\\\\|track.*end\\\\|PlayBuf.*loop\" /Users/Kevin/code/performative/crates --include=*.rs)"
+      "Bash(grep -r \"loop_monitor\\\\|check.*complete\\\\|track.*end\\\\|PlayBuf.*loop\" /Users/Kevin/code/performative/crates --include=*.rs)",
+      "Bash(cargo clippy:*)",
+      "Bash(xxd -l 32 /Users/Kevin/code/performative/synthdefs/deck_player.scsyndef)",
+      "WebFetch(domain:pypi.org)",
+      "WebFetch(domain:essentia.upf.edu)",
+      "Bash(uv --version)",
+      "Bash(time uv:*)",
+      "Bash(uv run:*)",
+      "Bash(uv pip:*)",
+      "Bash(find /Users/Kevin/code/performative/crates -name \"Cargo.toml\" -type f -exec wc -l {})",
+      "Bash(find /Users/Kevin/code/performative/crates -name \"*.rs\" -type f -exec wc -l {} +)",
+      "Read(//Users/Kevin/.performative/**)",
+      "Bash(cargo check:*)",
+      "Bash(uv python:*)",
+      "Bash(timeout 30 uv run --python \">=3.10,<3.14\" /Users/Kevin/code/performative/scripts/analyze.py /Users/Kevin/.performative/cache/transcode/4d1eb708484afc8b.wav)"
     ]
   }
 }

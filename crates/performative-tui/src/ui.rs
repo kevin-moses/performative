@@ -7,6 +7,7 @@
 ///   - A bordered block whose title and border color reflect deck and jog state.
 ///   - A track-name row with a right-aligned playback-state badge.
 ///   - A time-display row.
+///   - A BPM + key metadata row (populated once analysis completes).
 ///   - An EQ/gain row.
 ///   - A right-facing semicircle jog platter rendered via Canvas below the content rows, with
 ///     arc_position (0..2π) driving clockwise rotation in Ratatui's standard math coordinates.
@@ -46,7 +47,7 @@ pub fn render(frame: &mut Frame, state: &AppState) {
 
 /// Render a single deck panel.
 ///
-/// Draws a bordered block, then three content rows (track name, time, EQ/gain)
+/// Draws a bordered block, then four content rows (track name, time, BPM/key, EQ/gain)
 /// at the top, with a Canvas-based semicircle jog platter filling the remaining space
 /// below, rendered by `render_jog_platter()`.
 ///
@@ -89,9 +90,9 @@ fn render_deck(
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    // Split vertically: 3 content rows at top, remaining space for platter canvas
+    // Split vertically: 4 content rows at top, remaining space for platter canvas
     let deck_layout = Layout::vertical([
-        Constraint::Length(3),   // content rows (track, time, EQ)
+        Constraint::Length(4),   // content rows (track, time, metadata, EQ)
         Constraint::Min(4),      // platter canvas (at least 4 rows for a visible circle)
     ]);
     let [content_area, platter_area] = deck_layout.areas(inner);
@@ -99,9 +100,10 @@ fn render_deck(
     let rows = Layout::vertical([
         Constraint::Length(1), // track name + state badge
         Constraint::Length(1), // time display
+        Constraint::Length(1), // BPM + key metadata
         Constraint::Length(1), // EQ/gain row
     ]);
-    let [track_area, time_area, eq_area] = rows.areas(content_area);
+    let [track_area, time_area, meta_area, eq_area] = rows.areas(content_area);
 
     // Track name + right-aligned state badge
     let track_text = deck.track_name.as_deref().unwrap_or("—").to_string();
@@ -123,6 +125,26 @@ fn render_deck(
             .style(Style::default().fg(Color::White)),
         time_area,
     );
+
+    // BPM + key metadata
+    let bpm_text = deck.native_bpm
+        .map(|b| format!("{:.1} BPM", b))
+        .unwrap_or_else(|| "—".to_string());
+    let key_text = deck.key.as_deref().unwrap_or("");
+    let meta_line = if key_text.is_empty() {
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(bpm_text, Style::default().fg(Color::DarkGray)),
+        ])
+    } else {
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(bpm_text, Style::default().fg(Color::DarkGray)),
+            Span::raw("  "),
+            Span::styled(key_text.to_string(), Style::default().fg(Color::DarkGray)),
+        ])
+    };
+    frame.render_widget(Paragraph::new(meta_line), meta_area);
 
     // EQ / gain row
     let gain_db = linear_to_db(deck.gain);

@@ -51,6 +51,10 @@ async fn run_inner(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Res
     let _scsynth = engine.boot_scsynth().await?;
     state.lock().await.status_msg = "Ready. Type a command.".into();
 
+    // Start the background loop monitor (seeks decks back to loop in_secs when
+    // the playhead crosses out_secs). Must be spawned after scsynth is booted.
+    engine.spawn_loop_monitor();
+
     let mut ticker = interval(Duration::from_millis(33)); // ~30 fps
     let mut events = EventStream::new();
     let mut history: Vec<String> = load_history();

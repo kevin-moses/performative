@@ -4,6 +4,7 @@ members = [
     "crates/performative-core",
     "crates/performative-parser",
     "crates/performative-tui",
+    "crates/performative-analysis",
 ]
 resolver = "2"
 

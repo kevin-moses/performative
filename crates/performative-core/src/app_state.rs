@@ -2,6 +2,12 @@
 //
 // Application state shared between the TUI render loop and the audio engine.
 // `AppState` is wrapped in `Arc<Mutex<AppState>>` and cloned for each render frame.
+//
+// T5.1 additions:
+//   head_deck   — which deck is the BPM reference (0-indexed)
+//   cue_mix_up  — whether the cue_mix synth node is alive in scsynth
+//   cue_deck    — which deck (if any) is currently routed to the cue (headphone) bus
+//   cue_blend   — dry/wet blend for the cue mix output (0.0 = cue only, 1.0 = main)
 
 use std::time::Instant;
 
@@ -35,9 +41,20 @@ pub struct AppState {
     pub active_transition: Option<ActiveTransition>,
     /// Which deck (0 or 1) currently has jog focus; None when no deck is engaged.
     pub jog_deck: Option<usize>,
+    // ── T5.1 additions ────────────────────────────────────────────────────────
+    /// The reference deck for BPM/scheduling (0-indexed). Set by the `head` command.
+    /// Defaults to deck 0.
+    pub head_deck: usize,
+    /// True when the cue_mix synth node exists in scsynth.
+    pub cue_mix_up: bool,
+    /// Which deck is currently routed to the cue (headphone) bus. None = no cue routing.
+    pub cue_deck: Option<usize>,
+    /// Cue mix dry/wet blend. 0.0 = cue signal only, 1.0 = main mix only.
+    pub cue_blend: f32,
 }
 
 impl AppState {
+    /// Create a new `AppState` with all fields at their defaults.
     pub fn new() -> Self {
         Self {
             decks: [Deck::new(0), Deck::new(1)],
@@ -48,6 +65,10 @@ impl AppState {
             bpm: 120.0,
             active_transition: None,
             jog_deck: None,
+            head_deck: 0,
+            cue_mix_up: false,
+            cue_deck: None,
+            cue_blend: 0.0,
         }
     }
 }

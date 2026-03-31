@@ -8,9 +8,9 @@ use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration};
 
 use crate::app_state::{ActiveTransition, AppState};
-use crate::deck::{DeckState, PendingRamp, RampParam};
+use crate::deck::{BufferInfo, DeckState, LoopState, PendingRamp, RampParam};
 pub use performative_parser::{EqBand, RampDuration};
-use performative_parser::{Command, ParallelStep, Script, Statement, step_max_secs};
+use performative_parser::{Command, CueAction, LoopAction, ParallelStep, PreAction, Script, SeekPosition, Statement, step_max_secs};
 
 const SC_PORT: u16 = 57110;
 
@@ -51,14 +51,13 @@ impl AudioEngine {
         self.osc.send(msg::g_new_head(msg::ROOT_GROUP, 0)).await?;
 
         let synthdefs_dir = synthdefs_dir()?;
-        for def in &["deck_player", "deck_eq", "master_mix"] {
+        for def in &["deck_player", "deck_eq", "master_mix", "cue_mix"] {
             let path = synthdefs_dir.join(format!("{def}.scsyndef"));
             self.osc
-                .send(msg::d_load(path.to_str().unwrap()))
-                .await?;
+                .send_recv(msg::d_load(path.to_str().unwrap()), "/done", 5_000)
+                .await
+                .with_context(|| format!("d_load timed out for {def}"))?;
         }
-        // Give scsynth a moment to process the d_load messages.
-        sleep(Duration::from_millis(150)).await;
 
         self.state.lock().await.scsynth_ready = true;
         Ok(sc)
@@ -76,6 +75,19 @@ impl AudioEngine {
             .unwrap_or_default()
             .to_string_lossy()
             .to_string();
+
+        // Before resetting, free any running synths for this deck so scsynth does
+        // not reject the subsequent s_new calls with "duplicate node ID".
+        let synths_were_up = {
+            let st = self.state.lock().await;
+            st.decks[deck_idx].synths_up
+        };
+        if synths_were_up {
+            let player_node = msg::DECK_PLAYER_BASE + deck_idx as i32;
+            let eq_node     = msg::DECK_EQ_BASE     + deck_idx as i32;
+            let _ = self.osc.send(msg::n_free(player_node)).await;
+            let _ = self.osc.send(msg::n_free(eq_node)).await;
+        }
 
         {
             let mut st = self.state.lock().await;
@@ -101,23 +113,64 @@ impl AudioEngine {
             .await
             .context("b_allocRead timed out — is the file readable?")?;
 
-        // Query buffer info to determine track duration. /b_info returns:
-        //   [buf_num, num_frames, num_channels, sample_rate]
-        // Types can vary (Int vs Long, Float vs Double) so extract with a helper.
+        // Query buffer info. /b_info reply args:
+        //   [buf_num: Int, num_frames: Int, num_channels: Int, sample_rate: Float]
+        // Types can vary (Int vs Long, Float vs Double) so extract with osc_to_f32.
         if let Ok(info) = self.osc.send_recv(msg::b_query(buf_num), "/b_info", 5_000).await {
             if info.args.len() >= 4 {
-                let frames = osc_to_f32(&info.args[1]);
-                let sr = osc_to_f32(&info.args[3]);
-                if let (Some(f), Some(s)) = (frames, sr) {
-                    if s > 0.0 {
-                        self.state.lock().await.decks[deck_idx].track_duration = Some(f / s);
-                    }
+                let frames     = osc_to_f32(&info.args[1]);
+                let channels   = osc_to_f32(&info.args[2]);
+                let sr         = osc_to_f32(&info.args[3]);
+                if let (Some(f), Some(c), Some(s)) = (frames, channels, sr) {
+                    let buf_info = BufferInfo {
+                        num_frames:    f as i32,
+                        num_channels:  c as i32,
+                        sample_rate:   s,
+                    };
+                    let duration = buf_info.duration_secs();
+                    let mut st = self.state.lock().await;
+                    let deck = &mut st.decks[deck_idx];
+                    deck.buffer_info   = Some(buf_info);
+                    deck.track_duration = if s > 0.0 { Some(duration) } else { None };
+                    debug_log(&format!(
+                        "LOAD BUFFER deck={} frames={} channels={} sr={:.1} duration={:.4}",
+                        deck_idx, f as i32, c as i32, s, duration,
+                    ));
                 }
             }
         }
 
+        // Restore persisted cue points for this track if available.
+        if let Ok(points) = load_cue_points(&abs_str) {
+            let mut st = self.state.lock().await;
+            st.decks[deck_idx].cue_points = points;
+        }
+
         self.state.lock().await.status_msg =
             format!("Loaded: {track_name} → Deck {}", deck_idx + 1);
+
+        // Spawn background analysis — the deck is immediately playable.
+        let state_for_analysis = self.state.clone();
+        let path_for_analysis = abs_str.clone();
+        tokio::spawn(async move {
+            match performative_analysis::analyze(&path_for_analysis).await {
+                Ok(analysis) => {
+                    let mut st = state_for_analysis.lock().await;
+                    st.decks[deck_idx].native_bpm = Some(analysis.bpm);
+                    st.decks[deck_idx].key = Some(analysis.key.clone());
+                    if st.head_deck == deck_idx {
+                        st.bpm = analysis.bpm;
+                    }
+                    st.status_msg =
+                        format!("Analysis: {:.1} BPM, {}", analysis.bpm, analysis.key);
+                }
+                Err(e) => {
+                    let mut st = state_for_analysis.lock().await;
+                    st.status_msg = format!("Analysis unavailable: {e}");
+                }
+            }
+        });
+
         Ok(())
     }
 
@@ -204,6 +257,316 @@ impl AudioEngine {
             st.status_msg = format!("Paused Deck {}", deck_idx + 1);
         }
         Ok(())
+    }
+
+    /// Jump the playhead of a deck to the given position.
+    ///
+    /// Kills the current player synth and recreates it at the target frame so
+    /// scsynth's PlayBuf starts from the new position.  All other deck state
+    /// (gain, EQ, rate, loop) is preserved.
+    ///
+    /// Steps:
+    ///   1. Resolve `position` to an absolute `target_secs` value.
+    ///   2. Clamp to `0.0..buffer_duration`.
+    ///   3. Convert to frame index.
+    ///   4. Free the old player synth (`/n_free`).
+    ///   5. Create a new player synth at the target frame (`/s_new` with `start`
+    ///      param, added before the EQ node).
+    ///   6. If the deck was NOT playing, immediately pause the new synth.
+    ///   7. Update Rust-side elapsed tracking so the TUI stays in sync.
+    pub async fn seek(&self, deck_idx: usize, position: SeekPosition) -> Result<()> {
+        // Capture debug representation before the match consumes `position`.
+        let dbg_position = format!("{:?}", position);
+
+        // ── 1. Resolve position to seconds ────────────────────────────────────
+        let target_secs: f32 = {
+            let st = self.state.lock().await;
+            let deck = &st.decks[deck_idx];
+            let bpm = deck.native_bpm.unwrap_or(st.bpm);
+            let current_secs = deck.playback_elapsed.max(0.0);
+
+            match position {
+                SeekPosition::Seconds(s) => s,
+                SeekPosition::Bar(b) => {
+                    // Bar is 1-indexed: bar 1 = start of track.
+                    // Each bar = 4 beats at `bpm` BPM.
+                    // Duration of one bar in seconds = 60.0 / bpm * 4.0
+                    (b - 1.0) * 60.0 * 4.0 / bpm
+                }
+                SeekPosition::RelativeBars(b) => {
+                    let secs_per_bar = 60.0 * 4.0 / bpm;
+                    current_secs + b * secs_per_bar
+                }
+                SeekPosition::RelativeSeconds(s) => current_secs + s,
+                SeekPosition::CuePoint(label) => {
+                    match deck.cue_points.get(&label) {
+                        Some(&secs) => secs,
+                        None => {
+                            return Err(anyhow::anyhow!(
+                                "Cue point {} not set on deck {}",
+                                label,
+                                deck_idx + 1
+                            ));
+                        }
+                    }
+                }
+            }
+        };
+
+        debug_log(&format!(
+            "SEEK deck={} position={} target_secs={:.4}",
+            deck_idx, dbg_position, target_secs,
+        ));
+
+        // ── 2. Clamp to buffer duration ────────────────────────────────────────
+        let (target_secs, is_playing, gain, rate, buf_num) = {
+            let st = self.state.lock().await;
+            let deck = &st.decks[deck_idx];
+            let duration = deck
+                .buffer_info
+                .as_ref()
+                .map(|bi| bi.duration_secs())
+                .filter(|d| *d > 0.0)
+                .unwrap_or(f32::MAX);
+            let clamped = target_secs.clamp(0.0, duration);
+            debug_log(&format!(
+                "SEEK CLAMP deck={} duration={:.4} clamped={:.4} buf_info={:?}",
+                deck_idx, duration, clamped,
+                deck.buffer_info.as_ref().map(|bi| (bi.num_frames, bi.num_channels, bi.sample_rate)),
+            ));
+            let is_playing = deck.state == DeckState::Playing;
+            let buf_num = (msg::BUFFER_BASE + deck_idx as i32) as f32;
+            (clamped, is_playing, deck.gain, deck.rate, buf_num)
+        };
+
+        // ── 3. Convert to frame index ──────────────────────────────────────────
+        let target_frames: i32 = {
+            let st = self.state.lock().await;
+            let deck = &st.decks[deck_idx];
+            match &deck.buffer_info {
+                Some(bi) if bi.sample_rate > 0.0 => bi.secs_to_frames(target_secs),
+                _ => (target_secs * 44100.0) as i32,
+            }
+        };
+
+        let player_node = msg::DECK_PLAYER_BASE + deck_idx as i32;
+        let eq_node     = msg::DECK_EQ_BASE     + deck_idx as i32;
+        let out_bus     = (msg::DECK_BUS_BASE   + deck_idx as i32 * 2) as f32;
+
+        debug_log(&format!(
+            "SEEK EXEC deck={} target_secs={:.4} target_frames={} player_node={} eq_node={} is_playing={} rate={:.4}",
+            deck_idx, target_secs, target_frames, player_node, eq_node, is_playing, rate,
+        ));
+
+        // ── 4. Free the old player synth ──────────────────────────────────────
+        self.osc.send(msg::n_free(player_node)).await?;
+
+        // ── 5. Create a new player synth at the target position ──────────────
+        // addBefore (action=2) the EQ node keeps the graph order: player → eq → master.
+        self.osc
+            .send(msg::s_new(
+                "deck_player",
+                player_node,
+                2,        // addBefore
+                eq_node,  // target: EQ node
+                &[
+                    ("buf",      buf_num),
+                    ("rate",     rate),
+                    ("rate_lag", 0.0),
+                    ("gain",     gain),
+                    ("out_bus",  out_bus),
+                    ("loop_",    0.0),
+                    ("pos",      target_frames as f32),
+                ],
+            ))
+            .await?;
+
+        // ── 6. If not playing, immediately pause the new synth ────────────────
+        if !is_playing {
+            self.osc
+                .send(msg::n_run(player_node, false))
+                .await?;
+        }
+
+        // ── 7. Update Rust-side elapsed tracking ──────────────────────────────
+        let normalised = {
+            let mut st = self.state.lock().await;
+            let deck = &mut st.decks[deck_idx];
+            // Normalise elapsed by rate so that playback_elapsed * rate == target_secs.
+            let normalised = if deck.rate > 0.0 {
+                target_secs / deck.rate
+            } else {
+                target_secs
+            };
+            deck.playback_elapsed = normalised;
+            // Reset wall-clock play_start to now when playing so elapsed stays accurate.
+            if is_playing {
+                deck.play_start = Some(Instant::now());
+            }
+            st.status_msg = format!("Deck {} seeked to {:.1}s", deck_idx + 1, target_secs);
+            normalised
+        };
+        debug_log(&format!(
+            "SEEK DONE deck={} new_elapsed={:.4}",
+            deck_idx, normalised,
+        ));
+
+        Ok(())
+    }
+
+    /// Set the BPM/scheduling reference deck.
+    ///
+    /// Updates `head_deck` and, if the new head deck has a known `native_bpm`,
+    /// adopts that as the session BPM.
+    pub async fn set_head(&self, deck_idx: usize) {
+        let mut st = self.state.lock().await;
+        st.head_deck = deck_idx;
+        if let Some(bpm) = st.decks[deck_idx].native_bpm {
+            st.bpm = bpm;
+        }
+        st.status_msg = format!("Deck {} is now head", deck_idx + 1);
+    }
+
+    /// Route a deck to the cue (headphone) bus, stop cue routing, or adjust the blend.
+    ///
+    /// - `PreAction::Deck(idx)`: create the `cue_mix` synth if it does not exist, or
+    ///   redirect it to the new deck's bus. Sets `cue_active` on the target deck and
+    ///   clears it from any previous cue deck.
+    /// - `PreAction::Off`: free the `cue_mix` synth node and clear all cue state.
+    /// - `PreAction::Blend(v)`: adjust the dry/wet blend on the live `cue_mix` node.
+    pub async fn pre(&self, action: PreAction) -> Result<()> {
+        match action {
+            PreAction::Deck(deck_idx) => {
+                let (cue_mix_up, prev_cue_deck, cue_bus) = {
+                    let st = self.state.lock().await;
+                    let cue_bus = (msg::DECK_BUS_BASE + deck_idx as i32 * 2) as f32;
+                    (st.cue_mix_up, st.cue_deck, cue_bus)
+                };
+
+                if !cue_mix_up {
+                    // Create the cue_mix synth for the first time.
+                    self.osc
+                        .send(msg::s_new(
+                            "cue_mix",
+                            msg::CUE_MIX_NODE,
+                            1, // addToTail of the default group
+                            msg::ROOT_GROUP,
+                            &[("cue_bus", cue_bus)],
+                        ))
+                        .await?;
+                } else {
+                    // Redirect the existing cue_mix synth to the new deck's bus.
+                    self.osc
+                        .send(msg::n_set(msg::CUE_MIX_NODE, &[("cue_bus", cue_bus)]))
+                        .await?;
+                }
+
+                {
+                    let mut st = self.state.lock().await;
+                    // Clear cue_active from the previous cue deck.
+                    if let Some(prev) = prev_cue_deck {
+                        st.decks[prev].cue_active = false;
+                    }
+                    st.decks[deck_idx].cue_active = true;
+                    st.cue_deck = Some(deck_idx);
+                    st.cue_mix_up = true;
+                    st.status_msg = format!("Pre: Deck {} -> cue bus", deck_idx + 1);
+                }
+            }
+
+            PreAction::Off => {
+                self.osc.send(msg::n_free(msg::CUE_MIX_NODE)).await?;
+
+                let mut st = self.state.lock().await;
+                for deck in st.decks.iter_mut() {
+                    deck.cue_active = false;
+                }
+                st.cue_mix_up = false;
+                st.cue_deck = None;
+                st.status_msg = "Pre: cue off".into();
+            }
+
+            PreAction::Blend(v) => {
+                self.osc
+                    .send(msg::n_set(msg::CUE_MIX_NODE, &[("blend", v)]))
+                    .await?;
+
+                let mut st = self.state.lock().await;
+                st.cue_blend = v;
+                st.status_msg = format!("Pre blend: {:.2}", v);
+            }
+        }
+        Ok(())
+    }
+
+    /// Set a hot cue point at the current playhead, or jump to an existing one.
+    ///
+    /// - `CueAction::Set(label)`: records the current playhead position under `label`
+    ///   in the deck's `cue_points` map, then persists all cue points to
+    ///   `~/.performative/cache/<track_hash>/cues.json`.
+    ///
+    /// - `CueAction::Jump(label)`: looks up `label` in `deck.cue_points`; if found,
+    ///   delegates to `seek()` with `SeekPosition::Seconds(pos)`. If not found, sets
+    ///   an error status message and returns Ok (not a hard error, stays operational).
+    pub async fn cue(&self, deck_idx: usize, action: CueAction) -> Result<()> {
+        match action {
+            CueAction::Set(label) => {
+                // Snapshot position and track path before mutating state.
+                let (pos, track_path, dbg_elapsed, dbg_rate, dbg_state) = {
+                    let st = self.state.lock().await;
+                    let deck = &st.decks[deck_idx];
+                    (
+                        deck.playhead_secs_f32(),
+                        deck.track_path.clone(),
+                        deck.playback_elapsed,
+                        deck.rate,
+                        format!("{:?}", deck.state),
+                    )
+                };
+                debug_log(&format!(
+                    "CUE SET deck={} label={} elapsed={:.4} rate={:.4} pos={:.4} state={}",
+                    deck_idx, label, dbg_elapsed, dbg_rate, pos, dbg_state,
+                ));
+
+                {
+                    let mut st = self.state.lock().await;
+                    st.decks[deck_idx].cue_points.insert(label, pos);
+                    st.status_msg = format!("Cue {} set at {:.1}s", label, pos);
+                }
+
+                // Persist cue points to disk if we know the track path.
+                if let Some(path) = track_path {
+                    let cue_points = self.state.lock().await.decks[deck_idx].cue_points.clone();
+                    if let Err(e) = persist_cue_points(&path, &cue_points) {
+                        // Non-fatal: warn in status but don't propagate.
+                        self.state.lock().await.status_msg =
+                            format!("Cue {} set at {:.1}s (save failed: {e})", label, pos);
+                    }
+                }
+
+                Ok(())
+            }
+
+            CueAction::Jump(label) => {
+                let pos = {
+                    let st = self.state.lock().await;
+                    st.decks[deck_idx].cue_points.get(&label).copied()
+                };
+                debug_log(&format!(
+                    "CUE JUMP deck={} label={} stored_pos={:?}",
+                    deck_idx, label, pos,
+                ));
+
+                match pos {
+                    Some(secs) => self.seek(deck_idx, SeekPosition::Seconds(secs)).await,
+                    None => {
+                        self.state.lock().await.status_msg =
+                            format!("Cue point {} not set", label);
+                        Ok(())
+                    }
+                }
+            }
+        }
     }
 
     /// Set deck gain instantly or with a timed ramp.
@@ -367,11 +730,154 @@ impl AudioEngine {
                 st.status_msg = format!("Jog: Deck {}", deck + 1);
                 Ok(())
             }
+            Command::Head { deck } => {
+                self.set_head(deck).await;
+                Ok(())
+            }
+            Command::Seek { deck, position } => self.seek(deck, position).await,
+            Command::Pre { action } => self.pre(action).await,
+            Command::Loop { deck, action } => {
+                self.set_loop(deck, action).await;
+                Ok(())
+            }
+            Command::Cue { deck, action } => self.cue(deck, action).await,
             Command::Quit => {
                 self.state.lock().await.status_msg = "Type Esc or ctrl-c to quit.".into();
                 Ok(())
             }
         }
+    }
+
+    /// Set, modify, or clear a loop region on a deck.
+    ///
+    /// purpose: handle all `loop` sub-commands for a given deck.
+    ///   - Set(duration): capture current playhead as in_secs, compute out_secs from
+    ///     duration in seconds (using deck native_bpm or session BPM), clamp to buffer,
+    ///     and store LoopState.
+    ///   - Off: clear the active loop.
+    ///   - Halve: halve the loop length (out_secs moves toward in_secs).
+    ///   - Double: double the loop length (out_secs moves away from in_secs).
+    /// @param deck_idx: (usize) 0-based deck index
+    /// @param action: (LoopAction) the loop sub-action to perform
+    pub async fn set_loop(&self, deck_idx: usize, action: LoopAction) {
+        let mut st = self.state.lock().await;
+        let bpm = st.decks[deck_idx].native_bpm.unwrap_or(st.bpm);
+
+        match action {
+            LoopAction::Set(duration) => {
+                let in_secs = st.decks[deck_idx].playhead_secs_f32();
+                let duration_secs = duration.to_secs(bpm);
+                let mut out_secs = in_secs + duration_secs;
+
+                // Clamp out_secs to buffer length if buffer info is available.
+                if let Some(ref bi) = st.decks[deck_idx].buffer_info {
+                    let dur = bi.duration_secs();
+                    if dur > 0.0 {
+                        out_secs = out_secs.min(dur);
+                    }
+                }
+
+                // Compute length in bars: duration_secs / (4 * 60 / bpm)
+                let secs_per_bar = 4.0 * 60.0 / bpm;
+                let length_bars = if secs_per_bar > 0.0 {
+                    duration_secs / secs_per_bar
+                } else {
+                    0.0
+                };
+
+                st.decks[deck_idx].loop_state = Some(LoopState {
+                    in_secs,
+                    out_secs,
+                    length_bars,
+                });
+                st.status_msg = format!(
+                    "Deck {} loop: {:.1}s – {:.1}s ({:.2} bars)",
+                    deck_idx + 1, in_secs, out_secs, length_bars
+                );
+            }
+
+            LoopAction::Off => {
+                st.decks[deck_idx].loop_state = None;
+                st.status_msg = format!("Deck {} loop off", deck_idx + 1);
+            }
+
+            LoopAction::Halve => {
+                let deck = &mut st.decks[deck_idx];
+                if let Some(ref mut ls) = deck.loop_state {
+                    let half_len = (ls.out_secs - ls.in_secs) / 2.0;
+                    ls.out_secs = ls.in_secs + half_len;
+                    ls.length_bars /= 2.0;
+                    let msg = format!(
+                        "Deck {} loop halved: {:.1}s – {:.1}s ({:.2} bars)",
+                        deck_idx + 1, ls.in_secs, ls.out_secs, ls.length_bars
+                    );
+                    st.status_msg = msg;
+                } else {
+                    st.status_msg = format!("Deck {}: no active loop to halve", deck_idx + 1);
+                }
+            }
+
+            LoopAction::Double => {
+                let deck = &mut st.decks[deck_idx];
+                if let Some(ref mut ls) = deck.loop_state {
+                    let new_len = (ls.out_secs - ls.in_secs) * 2.0;
+                    ls.out_secs = ls.in_secs + new_len;
+                    ls.length_bars *= 2.0;
+                    let msg = format!(
+                        "Deck {} loop doubled: {:.1}s – {:.1}s ({:.2} bars)",
+                        deck_idx + 1, ls.in_secs, ls.out_secs, ls.length_bars
+                    );
+                    st.status_msg = msg;
+                } else {
+                    st.status_msg = format!("Deck {}: no active loop to double", deck_idx + 1);
+                }
+            }
+        }
+    }
+
+    /// Spawn the background loop monitor task.
+    ///
+    /// purpose: poll each deck at ~30ms intervals and, when a deck is playing with an
+    ///          active loop whose playhead has reached or passed out_secs, seek it back
+    ///          to in_secs. Must be called after scsynth is booted (since seek sends
+    ///          OSC messages to scsynth).
+    /// @param self: must be an Arc<AudioEngine> so the spawned task can hold a clone
+    pub fn spawn_loop_monitor(self: &Arc<Self>) {
+        let engine = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_millis(30));
+            loop {
+                ticker.tick().await;
+                for deck_idx in 0..2 {
+                    let should_seek = {
+                        let st = engine.state.lock().await;
+                        let deck = &st.decks[deck_idx];
+                        if deck.state == DeckState::Playing {
+                            if let Some(ref ls) = deck.loop_state {
+                                deck.playhead_secs_f32() >= ls.out_secs
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    };
+
+                    if should_seek {
+                        let in_secs = {
+                            let st = engine.state.lock().await;
+                            st.decks[deck_idx]
+                                .loop_state
+                                .as_ref()
+                                .map(|ls| ls.in_secs)
+                        };
+                        if let Some(secs) = in_secs {
+                            let _ = engine.seek(deck_idx, SeekPosition::Seconds(secs)).await;
+                        }
+                    }
+                }
+            }
+        });
     }
 
     async fn create_deck_synths(&self, deck_idx: usize, master_up: bool) -> Result<()> {
@@ -632,6 +1138,106 @@ fn dirs_cache_transcode() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".performative").join("cache").join("transcode"))
 }
 
+/// Return the cache directory for a specific track, keyed by a hash of its path.
+///
+/// purpose: provide a stable per-track directory under `~/.performative/cache/<hash>/`
+///          where persistent metadata (cue points, waveform data, etc.) can be stored.
+/// @param track_path: (str) absolute path to the audio file
+/// @return: `PathBuf` to `~/.performative/cache/<16-hex-hash>/`
+fn dirs_cache_for_track(track_path: &str) -> Result<PathBuf> {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    track_path.hash(&mut h);
+    let hash = h.finish();
+    let home = std::env::var("HOME").context("HOME env var not set")?;
+    Ok(PathBuf::from(home)
+        .join(".performative")
+        .join("cache")
+        .join(format!("{hash:016x}")))
+}
+
+/// Write the deck's cue points to `~/.performative/cache/<hash>/cues.json`.
+///
+/// purpose: persist hot cue points so they survive across sessions.
+/// @param track_path: (str) absolute path to the audio file (used to derive cache dir)
+/// @param cue_points: reference to the map of label → seconds
+/// @return: Ok(()) on success, or an error if the file cannot be written
+fn persist_cue_points(
+    track_path: &str,
+    cue_points: &std::collections::HashMap<char, f32>,
+) -> Result<()> {
+    let dir = dirs_cache_for_track(track_path)?;
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("failed to create cue cache dir: {}", dir.display()))?;
+
+    // Serialize as a JSON object with string keys: {"A": 32.5, "B": 96.0}
+    let map: std::collections::HashMap<String, f32> = cue_points
+        .iter()
+        .map(|(k, v)| (k.to_string(), *v))
+        .collect();
+
+    let json = serde_json::to_string_pretty(&map)
+        .context("failed to serialize cue points")?;
+
+    std::fs::write(dir.join("cues.json"), json)
+        .context("failed to write cues.json")?;
+
+    Ok(())
+}
+
+/// Append a timestamped diagnostic line to `~/.performative/debug.log`.
+///
+/// purpose: low-level debug logging for tracing cue/seek code paths without
+///          attaching a full tracing subscriber. Failures are silently ignored
+///          so this never affects runtime behaviour.
+/// @param msg: (&str) the message to append
+fn debug_log(msg: &str) {
+    use std::io::Write;
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    let path = std::path::PathBuf::from(home)
+        .join(".performative")
+        .join("debug.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        let _ = writeln!(f, "[{:.3}] {}", now, msg);
+    }
+}
+
+/// Read persisted cue points from `~/.performative/cache/<hash>/cues.json`.
+///
+/// purpose: restore hot cue points from a previous session on track load.
+/// @param track_path: (str) absolute path to the audio file (used to derive cache dir)
+/// @return: populated cue point map, or an empty map if no cues.json exists or it cannot be read
+fn load_cue_points(track_path: &str) -> Result<std::collections::HashMap<char, f32>> {
+    let path = dirs_cache_for_track(track_path)?.join("cues.json");
+    if !path.exists() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let json = std::fs::read_to_string(&path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+
+    let raw: std::collections::HashMap<String, f32> = serde_json::from_str(&json)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+
+    let mut result = std::collections::HashMap::new();
+    for (k, v) in raw {
+        if let Some(ch) = k.chars().next() {
+            if ('A'..='D').contains(&ch) {
+                result.insert(ch, v);
+            }
+        }
+    }
+    Ok(result)
+}
+
 fn synthdefs_dir() -> Result<std::path::PathBuf> {
     if let Ok(mut p) = std::env::current_exe() {
         p.pop();
@@ -657,4 +1263,70 @@ fn synthdefs_dir() -> Result<std::path::PathBuf> {
         }
     }
     anyhow::bail!("synthdefs dir not found — set PERFORMATIVE_SYNTHDEFS or run from project root")
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app_state::AppState;
+
+    /// Build a minimal `AudioEngine` backed by a real `AppState` but without a
+    /// live OSC connection. The `osc` field is never exercised by `set_head`, so
+    /// this is safe for unit tests.
+    async fn make_engine() -> AudioEngine {
+        let state = Arc::new(Mutex::new(AppState::new()));
+        // We cannot call AudioEngine::new() without a reachable scsynth, so we
+        // construct it directly using the public fields.
+        let osc = OscClient::new()
+            .await
+            .expect("OscClient::new() must not require a live server");
+        AudioEngine { osc, state }
+    }
+
+    #[tokio::test]
+    async fn set_head_updates_head_deck() {
+        let engine = make_engine().await;
+        engine.set_head(1).await;
+        let st = engine.state.lock().await;
+        assert_eq!(st.head_deck, 1);
+    }
+
+    #[tokio::test]
+    async fn set_head_adopts_native_bpm_when_present() {
+        let engine = make_engine().await;
+        {
+            let mut st = engine.state.lock().await;
+            st.decks[1].native_bpm = Some(140.0);
+        }
+        engine.set_head(1).await;
+        let st = engine.state.lock().await;
+        assert!((st.bpm - 140.0).abs() < 1e-6, "expected bpm=140.0, got {}", st.bpm);
+    }
+
+    #[tokio::test]
+    async fn set_head_does_not_change_bpm_when_native_bpm_absent() {
+        let engine = make_engine().await;
+        // Deck 0 has no native_bpm — global bpm stays at 120.0.
+        engine.set_head(0).await;
+        let st = engine.state.lock().await;
+        assert!((st.bpm - 120.0).abs() < 1e-6, "expected bpm=120.0, got {}", st.bpm);
+    }
+
+    #[tokio::test]
+    async fn set_head_sets_status_message() {
+        let engine = make_engine().await;
+        engine.set_head(0).await;
+        let st = engine.state.lock().await;
+        assert_eq!(st.status_msg, "Deck 1 is now head");
+    }
+
+    #[tokio::test]
+    async fn set_head_deck2_sets_status_message() {
+        let engine = make_engine().await;
+        engine.set_head(1).await;
+        let st = engine.state.lock().await;
+        assert_eq!(st.status_msg, "Deck 2 is now head");
+    }
 }

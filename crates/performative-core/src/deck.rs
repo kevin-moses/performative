@@ -3,15 +3,74 @@
 // Deck and jog state types used throughout the engine and TUI.
 //
 // Key types:
-//   Deck        — per-deck playback, EQ/gain, jog, and duration state
+//   Deck        — per-deck playback, EQ/gain, jog, loop, cue, and buffer state
+//   BufferInfo  — metadata returned by scsynth /b_info (frames, channels, sample rate)
+//   LoopState   — active loop region (in/out points and length in bars)
 //   JogState    — jog wheel interaction state machine data
 //   DeckState   — Empty | Loaded | Playing | Paused
 //   JogPhase    — Idle | Scratching | Releasing | Bending
 //
-// track_duration is populated by engine.rs after a successful b_allocRead + b_query
-// roundtrip and is used by the TUI tick loop to stop arc rotation when a song ends.
+// buffer_info is populated by engine.rs after a successful b_allocRead + b_query
+// roundtrip.  track_duration is derived from buffer_info for backwards compatibility.
+// cue_points persist per-track across sessions (not cleared on reset_playback).
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
+
+// ── Buffer metadata ───────────────────────────────────────────────────────────
+
+/// Metadata for a scsynth buffer, returned by the /b_info OSC reply.
+///
+/// Populated after a successful b_allocRead + b_query roundtrip in engine.rs.
+#[derive(Debug, Clone, Default)]
+pub struct BufferInfo {
+    pub num_frames: i32,
+    pub num_channels: i32,
+    pub sample_rate: f32,
+}
+
+impl BufferInfo {
+    /// Duration of the buffer in seconds.
+    ///
+    /// purpose: compute track length from frame count and sample rate.
+    /// @return: duration in seconds, or 0.0 if sample_rate is zero
+    pub fn duration_secs(&self) -> f32 {
+        if self.sample_rate > 0.0 {
+            self.num_frames as f32 / self.sample_rate
+        } else {
+            0.0
+        }
+    }
+
+    /// Convert a position in seconds to a frame index.
+    ///
+    /// purpose: translate a seek target from seconds to the integer frame offset
+    ///          required by scsynth's PlayBuf pos argument.
+    /// @param secs: (f32) position in seconds
+    /// @return: frame index (truncated, not rounded)
+    pub fn secs_to_frames(&self, secs: f32) -> i32 {
+        (secs * self.sample_rate) as i32
+    }
+}
+
+// ── Loop state ────────────────────────────────────────────────────────────────
+
+/// The active loop region for a deck.
+///
+/// Created when the user sets a loop; cleared with `loop off`.
+/// The loop monitor in engine.rs polls playhead_secs_f32() and seeks back to
+/// in_secs when the playhead crosses out_secs.
+#[derive(Debug, Clone)]
+pub struct LoopState {
+    /// Loop start point in seconds.
+    pub in_secs: f32,
+    /// Loop end point in seconds.
+    pub out_secs: f32,
+    /// Original length of the loop in bars (used for halve/double operations).
+    pub length_bars: f32,
+}
+
+// ── DeckState ─────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub enum DeckState {
@@ -21,6 +80,8 @@ pub enum DeckState {
     Playing,
     Paused,
 }
+
+// ── RampParam ─────────────────────────────────────────────────────────────────
 
 /// Which gain parameter a pending ramp targets.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -34,6 +95,8 @@ pub struct PendingRamp {
     pub target: f32,
     pub duration_secs: f32,
 }
+
+// ── JogMode / JogPhase ────────────────────────────────────────────────────────
 
 /// Whether the jog wheel operates in vinyl-scratch mode or pitch-bend mode.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -56,6 +119,8 @@ pub enum JogPhase {
     /// Wheel is nudging the rate up or down without full scratch engagement.
     Bending,
 }
+
+// ── JogState ──────────────────────────────────────────────────────────────────
 
 /// All mutable state for one deck's jog wheel, updated by the MIDI handler.
 #[derive(Debug, Clone)]
@@ -107,6 +172,8 @@ impl Default for JogState {
     }
 }
 
+// ── Deck ──────────────────────────────────────────────────────────────────────
+
 #[derive(Debug, Clone)]
 pub struct Deck {
     pub index: usize,
@@ -131,12 +198,37 @@ pub struct Deck {
     /// Accumulated playback time in seconds, adjusted for rate changes.
     /// Updated by the TUI tick loop. More accurate than wall-clock for jog scenarios.
     pub playback_elapsed: f32,
-    /// Total duration of the loaded track in seconds. Populated after a successful
-    /// b_allocRead + b_query roundtrip. None until a track is loaded.
+    /// Total duration of the loaded track in seconds. Derived from buffer_info
+    /// for backwards compatibility. None until a track is loaded.
     pub track_duration: Option<f32>,
+    // ── T5.1 additions ────────────────────────────────────────────────────────
+    /// Full buffer metadata returned by scsynth /b_info after load.
+    pub buffer_info: Option<BufferInfo>,
+    /// BPM detected by the analysis crate (None until analysis completes).
+    pub native_bpm: Option<f32>,
+    /// Musical key detected by the analysis crate (e.g. "A minor"). None until analysis completes.
+    pub key: Option<String>,
+    /// Effective playback BPM when synced; mirrors rate * native_bpm.
+    pub playing_bpm: Option<f32>,
+    /// Current playback rate multiplier sent to scsynth. Default 1.0.
+    pub rate: f32,
+    /// Named cue points in seconds. Keyed by a single character label (e.g. 'A').
+    /// Persists across loads — not cleared by reset_playback().
+    pub cue_points: HashMap<char, f32>,
+    /// Active loop region, if any. Cleared by reset_playback().
+    pub loop_state: Option<LoopState>,
+    /// True when this deck is routed to the cue (headphone) bus.
+    pub cue_active: bool,
+    /// True when this deck's rate is locked to the head deck's BPM.
+    pub synced: bool,
 }
 
 impl Deck {
+    /// Create a new `Deck` with all fields at their defaults.
+    ///
+    /// purpose: initialise a clean, empty deck slot.
+    /// @param index: (usize) 0-based deck index
+    /// @return: fully initialised Deck
     pub fn new(index: usize) -> Self {
         Self {
             index,
@@ -154,7 +246,26 @@ impl Deck {
             jog: JogState::new(),
             playback_elapsed: 0.0,
             track_duration: None,
+            buffer_info: None,
+            native_bpm: None,
+            key: None,
+            playing_bpm: None,
+            rate: 1.0,
+            cue_points: HashMap::new(),
+            loop_state: None,
+            cue_active: false,
+            synced: false,
         }
+    }
+
+    /// Current playhead position in seconds (rate-adjusted), as a float.
+    ///
+    /// purpose: return the precise playhead position for seek/loop/cue operations.
+    ///          playback_elapsed tracks wall-time accumulation; the rate multiplier
+    ///          converts that to actual buffer position.
+    /// @return: playhead position in seconds as f32
+    pub fn playhead_secs_f32(&self) -> f32 {
+        self.playback_elapsed.max(0.0) * self.rate
     }
 
     /// Total elapsed playhead time in seconds, rate-adjusted.
@@ -183,7 +294,11 @@ impl Deck {
         format!("{}:{:02}", secs / 60, secs % 60)
     }
 
-    /// Reset all playback state (called on load of a new track).
+    /// Reset all playback state when a new track is loaded.
+    ///
+    /// purpose: tear down synth/playhead/loop/sync state for a new load.
+    ///          cue_points are intentionally preserved so hot cues survive
+    ///          across loads within the same session.
     pub fn reset_playback(&mut self) {
         self.synths_up = false;
         self.elapsed_before = Duration::ZERO;
@@ -197,11 +312,213 @@ impl Deck {
         self.jog = JogState::new();
         self.playback_elapsed = 0.0;
         self.track_duration = None;
+        // T5.1 fields reset on load:
+        self.buffer_info = None;
+        self.rate = 1.0;
+        self.loop_state = None;
+        self.synced = false;
+        self.playing_bpm = None;
+        self.cue_active = false;
+        // cue_points intentionally NOT cleared — they persist per-track.
     }
 }
 
 impl Default for Deck {
     fn default() -> Self {
         Self::new(0)
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── BufferInfo::duration_secs ─────────────────────────────────────────────
+
+    #[test]
+    fn buffer_info_duration_secs_exact_one_second() {
+        let info = BufferInfo { num_frames: 44100, num_channels: 2, sample_rate: 44100.0 };
+        let dur = info.duration_secs();
+        assert!((dur - 1.0).abs() < 1e-6, "expected 1.0, got {dur}");
+    }
+
+    #[test]
+    fn buffer_info_duration_secs_zero_sample_rate_returns_zero() {
+        let info = BufferInfo { num_frames: 44100, num_channels: 2, sample_rate: 0.0 };
+        assert_eq!(info.duration_secs(), 0.0);
+    }
+
+    #[test]
+    fn buffer_info_duration_secs_fractional() {
+        // 22050 frames at 44100 Hz = 0.5 seconds
+        let info = BufferInfo { num_frames: 22050, num_channels: 2, sample_rate: 44100.0 };
+        let dur = info.duration_secs();
+        assert!((dur - 0.5).abs() < 1e-6, "expected 0.5, got {dur}");
+    }
+
+    // ── BufferInfo::secs_to_frames ────────────────────────────────────────────
+
+    #[test]
+    fn buffer_info_secs_to_frames_roundtrip() {
+        let info = BufferInfo { num_frames: 441000, num_channels: 2, sample_rate: 44100.0 };
+        let frames = info.secs_to_frames(1.0);
+        assert_eq!(frames, 44100);
+    }
+
+    #[test]
+    fn buffer_info_secs_to_frames_truncates_not_rounds() {
+        let info = BufferInfo { num_frames: 441000, num_channels: 2, sample_rate: 44100.0 };
+        // 0.9999... seconds * 44100 should truncate, not round up
+        let frames = info.secs_to_frames(0.5);
+        assert_eq!(frames, 22050);
+    }
+
+    #[test]
+    fn buffer_info_secs_to_frames_zero() {
+        let info = BufferInfo { num_frames: 441000, num_channels: 2, sample_rate: 44100.0 };
+        assert_eq!(info.secs_to_frames(0.0), 0);
+    }
+
+    // ── Deck::playhead_secs_f32 ───────────────────────────────────────────────
+
+    #[test]
+    fn playhead_secs_f32_at_normal_rate() {
+        let mut deck = Deck::new(0);
+        deck.playback_elapsed = 30.0;
+        deck.rate = 1.0;
+        let pos = deck.playhead_secs_f32();
+        assert!((pos - 30.0).abs() < 1e-6, "expected 30.0, got {pos}");
+    }
+
+    #[test]
+    fn playhead_secs_f32_accounts_for_rate_above_one() {
+        let mut deck = Deck::new(0);
+        deck.playback_elapsed = 10.0;
+        deck.rate = 1.5;
+        // Buffer advances at 1.5x: 10.0 * 1.5 = 15.0
+        let pos = deck.playhead_secs_f32();
+        assert!((pos - 15.0).abs() < 1e-6, "expected 15.0, got {pos}");
+    }
+
+    #[test]
+    fn playhead_secs_f32_accounts_for_rate_below_one() {
+        let mut deck = Deck::new(0);
+        deck.playback_elapsed = 20.0;
+        deck.rate = 0.5;
+        // Buffer advances at half speed: 20.0 * 0.5 = 10.0
+        let pos = deck.playhead_secs_f32();
+        assert!((pos - 10.0).abs() < 1e-6, "expected 10.0, got {pos}");
+    }
+
+    #[test]
+    fn playhead_secs_f32_clamps_negative_elapsed_to_zero() {
+        let mut deck = Deck::new(0);
+        deck.playback_elapsed = -5.0;
+        deck.rate = 1.0;
+        let pos = deck.playhead_secs_f32();
+        assert_eq!(pos, 0.0);
+    }
+
+    // ── Deck::reset_playback ──────────────────────────────────────────────────
+
+    #[test]
+    fn reset_playback_clears_loop_state() {
+        let mut deck = Deck::new(0);
+        deck.loop_state = Some(LoopState { in_secs: 4.0, out_secs: 8.0, length_bars: 4.0 });
+        deck.reset_playback();
+        assert!(deck.loop_state.is_none());
+    }
+
+    #[test]
+    fn reset_playback_resets_rate_to_one() {
+        let mut deck = Deck::new(0);
+        deck.rate = 1.25;
+        deck.reset_playback();
+        assert!((deck.rate - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn reset_playback_clears_synced() {
+        let mut deck = Deck::new(0);
+        deck.synced = true;
+        deck.reset_playback();
+        assert!(!deck.synced);
+    }
+
+    #[test]
+    fn reset_playback_clears_playing_bpm() {
+        let mut deck = Deck::new(0);
+        deck.playing_bpm = Some(128.0);
+        deck.reset_playback();
+        assert!(deck.playing_bpm.is_none());
+    }
+
+    #[test]
+    fn reset_playback_clears_cue_active() {
+        let mut deck = Deck::new(0);
+        deck.cue_active = true;
+        deck.reset_playback();
+        assert!(!deck.cue_active);
+    }
+
+    #[test]
+    fn reset_playback_preserves_cue_points() {
+        let mut deck = Deck::new(0);
+        deck.cue_points.insert('A', 32.5);
+        deck.cue_points.insert('B', 96.0);
+        deck.reset_playback();
+        // Cue points must survive a load/reset cycle.
+        assert_eq!(deck.cue_points.get(&'A'), Some(&32.5));
+        assert_eq!(deck.cue_points.get(&'B'), Some(&96.0));
+    }
+
+    #[test]
+    fn reset_playback_clears_buffer_info() {
+        let mut deck = Deck::new(0);
+        deck.buffer_info = Some(BufferInfo { num_frames: 44100, num_channels: 2, sample_rate: 44100.0 });
+        deck.reset_playback();
+        assert!(deck.buffer_info.is_none());
+    }
+
+    #[test]
+    fn reset_playback_sets_state_to_loaded() {
+        let mut deck = Deck::new(0);
+        deck.state = DeckState::Playing;
+        deck.reset_playback();
+        assert_eq!(deck.state, DeckState::Loaded);
+    }
+
+    // ── Default / new ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn deck_new_has_rate_one() {
+        let deck = Deck::new(0);
+        assert!((deck.rate - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn deck_new_has_empty_cue_points() {
+        let deck = Deck::new(0);
+        assert!(deck.cue_points.is_empty());
+    }
+
+    #[test]
+    fn deck_new_has_no_loop_state() {
+        let deck = Deck::new(0);
+        assert!(deck.loop_state.is_none());
+    }
+
+    #[test]
+    fn deck_new_not_synced() {
+        let deck = Deck::new(0);
+        assert!(!deck.synced);
+    }
+
+    #[test]
+    fn deck_new_cue_active_false() {
+        let deck = Deck::new(0);
+        assert!(!deck.cue_active);
     }
 }

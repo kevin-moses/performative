@@ -4,8 +4,11 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-performative-osc    = { path = "../performative-osc" }
-performative-parser = { path = "../performative-parser" }
-tokio               = { workspace = true }
-anyhow              = { workspace = true }
-rosc                = { workspace = true }
+performative-osc      = { path = "../performative-osc" }
+performative-parser   = { path = "../performative-parser" }
+performative-analysis = { path = "../performative-analysis" }
+tokio                 = { workspace = true }
+anyhow                = { workspace = true }
+rosc                  = { workspace = true }
+serde                 = { version = "1", features = ["derive"] }
+serde_json            = "1"

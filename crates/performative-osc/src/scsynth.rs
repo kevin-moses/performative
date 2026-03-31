@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::time::Duration;
 
 /// Locations where scsynth might be found on macOS.
 const SCSYNTH_CANDIDATES: &[&str] = &[
@@ -30,7 +31,13 @@ impl Scsynth {
     /// Boot scsynth on the given UDP port. Returns once the process is running
     /// (does NOT wait for audio-ready; call OscClient::wait_for_ready() after).
     /// Logs stdout+stderr to ~/.performative/scsynth.log for debugging.
+    ///
+    /// Kills any existing scsynth on the target port before spawning so that a
+    /// zombie process from a previous crash cannot steal the `/status.reply`
+    /// and make `wait_for_ready()` falsely succeed against stale state.
     pub fn boot(port: u16) -> Result<Self> {
+        kill_existing(port);
+
         let bin = Self::find().context(
             "scsynth not found. Install SuperCollider: brew install --cask supercollider",
         )?;
@@ -73,6 +80,34 @@ impl Drop for Scsynth {
     fn drop(&mut self) {
         self.quit();
     }
+}
+
+/// Ensure no stale scsynth process is holding `port` before we try to bind it.
+///
+/// Steps:
+/// 1. Send an OSC `/quit` message — graceful shutdown if scsynth is alive.
+/// 2. `pkill -f scsynth` as a hard fallback for processes that ignore `/quit`.
+/// 3. Sleep 500 ms so the OS has time to release the UDP port.
+///
+/// All errors are intentionally swallowed: if there is nothing to kill the
+/// operations are harmless no-ops.
+fn kill_existing(port: u16) {
+    // Step 1: graceful /quit via OSC.
+    if let Ok(sock) = std::net::UdpSocket::bind("127.0.0.1:0") {
+        let quit_msg = rosc::encoder::encode(&rosc::OscPacket::Message(rosc::OscMessage {
+            addr: "/quit".into(),
+            args: vec![],
+        }));
+        if let Ok(bytes) = quit_msg {
+            let _ = sock.send_to(&bytes, format!("127.0.0.1:{port}"));
+        }
+    }
+
+    // Step 2: hard kill as a fallback.
+    let _ = Command::new("pkill").args(["-f", "scsynth"]).output();
+
+    // Step 3: wait for the port to be released by the OS.
+    std::thread::sleep(Duration::from_millis(500));
 }
 
 fn open_log_file() -> Result<fs::File> {
