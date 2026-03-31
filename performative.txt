@@ -90,7 +90,7 @@ Track file (any format)
     → FFmpeg/Symphonia  — decode to WAV (Symphonia is pure Rust, no FFmpeg needed for common formats)
     → Essentia (Python)  — BPM, key, downbeats, section boundaries, energy curve
     → Cache             — stored in ~/.performative/cache/<track_hash>/
-    
+
 Phase 2 (deferred to v1.1+):
     → Demucs-MLX        — stem separation (drums, bass, vocals, other)
     → Rubberband        — pre-computed time-stretch at target BPMs (±15% range, 1 BPM increments)
@@ -601,12 +601,12 @@ loop {
         Some(event) = keyboard_rx.recv() => {
             handle_key(event, &mut state, &osc_tx);
         }
-        
+
         // 2. OSC responses from scsynth
         Some(msg) = osc_rx.recv() => {
             handle_osc_response(msg, &mut state);
         }
-        
+
         // 3. UI tick (30fps)
         _ = tick_interval.tick() => {
             // Update playhead positions, beat counters

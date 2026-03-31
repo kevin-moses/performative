@@ -70,7 +70,12 @@
       "Read(//Users/Kevin/.performative/**)",
       "Bash(cargo check:*)",
       "Bash(uv python:*)",
-      "Bash(timeout 30 uv run --python \">=3.10,<3.14\" /Users/Kevin/code/performative/scripts/analyze.py /Users/Kevin/.performative/cache/transcode/4d1eb708484afc8b.wav)"
+      "Bash(timeout 30 uv run --python \">=3.10,<3.14\" /Users/Kevin/code/performative/scripts/analyze.py /Users/Kevin/.performative/cache/transcode/4d1eb708484afc8b.wav)",
+      "WebFetch(domain:prek.j178.dev)",
+      "Bash(prek install:*)",
+      "Bash(prek run:*)",
+      "Bash(chmod:*)",
+      "Bash(git update-index:*)"
     ]
   }
 }
